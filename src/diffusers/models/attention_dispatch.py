@@ -1214,6 +1214,226 @@ class TemplatedUlyssesAttention(torch.autograd.Function):
 
         return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
 
+class TemplatedUnifiedAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        dropout_p: float,
+        is_causal: bool,
+        scale: Optional[float],
+        enable_gqa: bool,
+        return_lse: bool,
+        forward_op,
+        backward_op,
+        _parallel_config: Optional["ParallelConfig"] = None,
+    ):
+        """
+        Unified Attention combining Ring and Ulysses attention.
+        
+        Algorithm:
+        1. Ulysses head splitting: Split heads across ulysses dimension (within each ring group)
+        2. Ring sequence rotation: Rotate sequence chunks across ring dimension (within each ulysses group)
+        3. Ulysses head gathering: Gather heads back (within each ring group)
+        """
+        ring_mesh = _parallel_config.context_parallel_config._ring_mesh
+        ulysses_mesh = _parallel_config.context_parallel_config._ulysses_mesh
+        ring_degree = _parallel_config.context_parallel_config.ring_degree
+        ulysses_degree = _parallel_config.context_parallel_config.ulysses_degree
+        ring_local_rank = _parallel_config.context_parallel_config._ring_local_rank
+
+        ctx.forward_op = forward_op
+        ctx.backward_op = backward_op
+        ctx.q_shape = query.shape
+        ctx.kv_shape = key.shape
+        ctx._parallel_config = _parallel_config
+        ctx.ring_degree = ring_degree
+        ctx.ulysses_degree = ulysses_degree
+
+        B, S_Q_LOCAL, H, D = query.shape
+        _, S_KV_LOCAL, _, _ = key.shape
+        H_LOCAL = H // ulysses_degree
+
+        
+        query = query.reshape(B, S_Q_LOCAL, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        key = key.reshape(B, S_KV_LOCAL, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        value = value.reshape(B, S_KV_LOCAL, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+
+       
+        ulysses_group = ulysses_mesh.get_group()
+        query, key, value = (_all_to_all_single(x, ulysses_group) for x in (query, key, value))
+
+        query = query.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+        key = key.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+        value = value.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        ring_group = ring_mesh.get_group()
+        ring_rank = ring_local_rank
+        next_ring_rank = (ring_rank + 1) % ring_degree
+        prev_out = prev_lse = None
+
+
+        kv_buffer = torch.cat([key.flatten(), value.flatten()]).contiguous()
+        kv_buffer = funcol.all_gather_tensor(kv_buffer, gather_dim=0, group=ring_group)
+        kv_buffer = kv_buffer.chunk(ring_degree)
+
+        for i in range(ring_degree):
+            if i > 0:
+                kv = kv_buffer[next_ring_rank]
+                key_numel = key.numel()
+                key = kv[:key_numel].reshape_as(key)
+                value = kv[key_numel:].reshape_as(value)
+                next_ring_rank = (next_ring_rank + 1) % ring_degree
+
+            out, lse = forward_op(
+                ctx,
+                query,
+                key,
+                value,
+                attn_mask,
+                dropout_p,
+                is_causal,
+                scale,
+                enable_gqa,
+                True,
+                _save_ctx=i == 0,
+                _parallel_config=_parallel_config,
+            )
+
+            
+            if _parallel_config.context_parallel_config.convert_to_fp32:
+                out = out.to(torch.float32)
+                lse = lse.to(torch.float32)
+
+            
+            lse = lse.unsqueeze(-1)
+            if prev_out is not None:
+                out = prev_out - torch.nn.functional.sigmoid(lse - prev_lse) * (prev_out - out)
+                lse = prev_lse - torch.nn.functional.logsigmoid(prev_lse - lse)
+            prev_out = out
+            prev_lse = lse
+
+        out = out.to(query.dtype)
+        lse = lse.squeeze(-1)
+
+        
+        out = out.reshape(B, S_Q_LOCAL, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        out = _all_to_all_single(out, ulysses_group)
+        out = out.flatten(0, 1).permute(1, 2, 0, 3).contiguous()
+
+        if return_lse:
+            lse = lse.reshape(B, S_Q_LOCAL, ulysses_degree, H_LOCAL).permute(2, 1, 0, 3).contiguous()
+            lse = _all_to_all_single(lse, ulysses_group)
+            lse = lse.flatten(0, 1).permute(1, 2, 0).contiguous()
+        else:
+            lse = None
+
+        return (out, lse) if return_lse else out
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_out: torch.Tensor,
+        *args,
+    ):
+        """
+        Backward pass for Unified Attention.
+        
+        Algorithm (reverse of forward):
+        1. Ulysses head splitting of gradients
+        2. Ring gradient accumulation
+        3. Ulysses head gathering of gradients
+        """
+        ring_mesh = ctx._parallel_config.context_parallel_config._ring_mesh
+        ulysses_mesh = ctx._parallel_config.context_parallel_config._ulysses_mesh
+        ring_degree = ctx.ring_degree
+        ulysses_degree = ctx.ulysses_degree
+        ring_local_rank = ctx._parallel_config.context_parallel_config._ring_local_rank
+        ulysses_group = ulysses_mesh.get_group()
+        ring_group = ring_mesh.get_group()
+
+        B, S_LOCAL, H, D = grad_out.shape
+        H_LOCAL = H // ulysses_degree
+
+        
+        grad_out = grad_out.reshape(B, S_LOCAL, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        grad_out = _all_to_all_single(grad_out, ulysses_group)
+        grad_out = grad_out.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        
+        accum_dtype = (
+            torch.float32 if ctx._parallel_config.context_parallel_config.convert_to_fp32 else grad_out.dtype
+        )
+        grad_query = torch.zeros(ctx.q_shape, dtype=accum_dtype, device=grad_out.device)
+        grad_key = torch.zeros(ctx.kv_shape, dtype=accum_dtype, device=grad_out.device)
+        grad_value = torch.zeros(ctx.kv_shape, dtype=accum_dtype, device=grad_out.device)
+        next_grad_kv = None
+
+        query, key, value, *_ = ctx.saved_tensors
+        
+        _, S_Q_ORIG, _, _ = query.shape
+        _, S_KV_ORIG, _, _ = key.shape
+        query = query.reshape(B, S_Q_ORIG, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        key = key.reshape(B, S_KV_ORIG, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        value = value.reshape(B, S_KV_ORIG, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        query, key, value = (_all_to_all_single(x, ulysses_group) for x in (query, key, value))
+        query = query.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+        key = key.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+        value = value.flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        
+        kv_buffer = torch.cat([key.flatten(), value.flatten()]).contiguous()
+        kv_buffer = funcol.all_gather_tensor(kv_buffer, gather_dim=0, group=ring_group)
+        kv_buffer = kv_buffer.chunk(ring_degree)
+
+        ring_rank = ring_local_rank
+        next_ring_rank = (ring_rank + 1) % ring_degree
+        next_ranks = list(range(1, ring_degree)) + [0]
+
+        for i in range(ring_degree):
+            if i > 0:
+                kv = kv_buffer[next_ring_rank]
+                key_numel = key.numel()
+                key = kv[:key_numel].reshape_as(key)
+                value = kv[key_numel:].reshape_as(value)
+                next_ring_rank = (next_ring_rank + 1) % ring_degree
+
+            
+            grad_query_op, grad_key_op, grad_value_op, *_ = ctx.backward_op(ctx, grad_out)
+
+            if i > 0:
+                grad_kv_buffer = _wait_tensor(next_grad_kv)
+                grad_key_numel = grad_key.numel()
+                grad_key = grad_kv_buffer[:grad_key_numel].reshape_as(grad_key)
+                grad_value = grad_kv_buffer[grad_key_numel:].reshape_as(grad_value)
+
+            grad_query += grad_query_op
+            grad_key += grad_key_op
+            grad_value += grad_value_op
+
+            if i < ring_degree - 1:
+                grad_kv_buffer = torch.cat([grad_key.flatten(), grad_value.flatten()]).contiguous()
+                next_grad_kv = funcol.permute_tensor(grad_kv_buffer, next_ranks, group=ring_group)
+
+        grad_query, grad_key, grad_value = (x.to(grad_out.dtype) for x in (grad_query, grad_key, grad_value))
+
+        
+        _, S_Q_GRAD, _, _ = grad_query.shape
+        _, S_KV_GRAD, _, _ = grad_key.shape
+        grad_query = grad_query.reshape(B, S_Q_GRAD, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        grad_key = grad_key.reshape(B, S_KV_GRAD, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+        grad_value = grad_value.reshape(B, S_KV_GRAD, ulysses_degree, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+
+        grad_query, grad_key, grad_value = (_all_to_all_single(x, ulysses_group) for x in (grad_query, grad_key, grad_value))
+        grad_query, grad_key, grad_value = (
+            x.flatten(0, 1).permute(1, 2, 0, 3).contiguous() for x in (grad_query, grad_key, grad_value)
+        )
+
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None, None, None
+
 
 def _templated_context_parallel_attention(
     query: torch.Tensor,
